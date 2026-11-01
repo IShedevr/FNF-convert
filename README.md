@@ -1,3 +1,6 @@
+# Warning
+This is important, Convex currently cannot export more than one single animation, in the future I will add more capabilities for non-single animations
+
 # FNF-convert
 Converting new sprites to old ones from 2018. I am an independent developer and this project is NOT AN OFFICIAL FNF OR PSYCH ENGINE PROJECT.
 
