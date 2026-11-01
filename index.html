@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Animate → FNF · Recursive Renderer</title>
+<style>
+:root{color-scheme:dark;--bg:#101116;--panel:#191b24;--line:#303342;--text:#f1f2f7;--muted:#a4a8b8;--accent:#8b7cff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,Arial,sans-serif}
+main{max-width:980px;margin:auto;padding:16px}h1{font-size:22px;margin:4px 0 8px}p{color:var(--muted);line-height:1.45}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}
+.files{display:grid;gap:12px}.file label{display:block;font-weight:650;margin-bottom:6px}.file input{width:100%;padding:10px;background:#10121a;border:1px solid var(--line);border-radius:9px;color:var(--text)}
+button{border:0;border-radius:10px;padding:12px 15px;background:var(--accent);color:white;font-weight:700;font-size:15px}
+button.secondary{background:#303342}button:disabled{opacity:.4}
+.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.controls button{flex:1;min-width:90px}
+#previewWrap{background:#08090d;border-radius:10px;min-height:220px;display:grid;place-items:center;overflow:auto;padding:8px}
+canvas{max-width:100%;height:auto;image-rendering:auto}#preview{max-height:65vh}
+#status{white-space:pre-wrap;color:#c9cbe0;font-size:13px;line-height:1.5}
+.small{font-size:12px;color:var(--muted)}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.row label{color:var(--muted)}
+input[type=checkbox]{accent-color:var(--accent)}
+#frameText{min-width:95px;text-align:center;font-variant-numeric:tabular-nums}
+progress{width:100%;height:9px;accent-color:var(--accent)}
+</style>
+</head>
+<body>
+<main>
+<h1>Adobe Animate → FNF / Psych Engine</h1>
+<p>Рекурсивная сборка символов из <b>AN → SI → SD → TL → ASI</b>. Обрабатывает вложенные символы, кадры FF, матрицы M3D и прозрачность слоёв. Работает локально в браузере.</p>
+<section class="panel files">
+ <div class="file"><label>1. spritemap1.png — атлас</label><input id="png" type="file" accept="image/png"></div>
+ <div class="file"><label>2. spritemap1.json — координаты атласа</label><input id="atlas" type="file" accept=".json,application/json"></div>
+ <div class="file"><label>3. Animation.json — таймлайны AN и SD</label><input id="anim" type="file" accept=".json,application/json"></div>
+ <button id="build">Собрать анимацию</button>
+ <div id="status">Выбери три файла и нажми «Собрать анимацию».</div>
+ <progress id="progress" value="0" max="100" hidden></progress>
+</section>
+<section class="panel">
+ <div class="row" style="justify-content:space-between;margin-bottom:10px">
+  <b>Предпросмотр</b><span id="frameText">Кадр — / —</span>
+ </div>
+ <div id="previewWrap"><canvas id="preview" width="320" height="240"></canvas></div>
+ <div class="controls" style="margin-top:10px">
+  <button class="secondary" id="prev" disabled>◀</button>
+  <button id="play" disabled>▶ Воспроизвести</button>
+  <button class="secondary" id="next" disabled>▶|</button>
+ </div>
+ <div class="row" style="margin-top:12px">
+  <label for="speed">Скорость</label><input id="speed" type="range" min="1" max="48" value="24">
+  <span id="speedText">24 FPS</span>
+  <label><input id="reverse" type="checkbox" checked> Порядок слоёв Animate (сверху вниз)</label>
+ </div>
+</section>
+<section class="panel">
+ <b>Экспорт для Psych Engine</b>
+ <p class="small">Создаёт один общий PNG-атлас с одинаковым размером каждого кадра и Sparrow XML. Кадры не обрезаются отдельно — положение персонажа не должно прыгать из-за разного trim.</p>
+ <button id="export" disabled>Экспортировать PNG + XML</button>
+ <div class="small" id="exportInfo"></div>
+</section>
+</main>
+<script>
+(()=>{
+'use strict';
+const $=id=>document.getElementById(id);
+let atlasImg=null, atlasMap=null, anim=null, frames=[], fps=24, timer=null, current=0, stage=null;
+const status=s=>$('status').textContent=s;
+const matrix=m=>Array.isArray(m)&&m.length>=16?[m[0],m[1],m[4],m[5],m[12],m[13]]:[1,0,0,1,0,0];
+function mul(A,B){
+ const [a,b,c,d,e,f]=A,[g,h,i,j,k,l]=B;
+ return [a*g+c*h,b*g+d*h,a*i+c*j,b*i+d*j,a*k+c*l+e,b*k+d*l+f];
+}
+function parseAtlas(j){
+ const list=j?.ATLAS?.SPRITES;
+ if(!Array.isArray(list))throw Error('В spritemap1.json нет ATLAS.SPRITES');
+ const out=new Map();
+ for(const item of list){const s=item.SPRITE||item;if(s.name!=null)out.set(String(s.name),s);}
+ return out;
+}
+function layersOf(sym){return sym?.TL?.L||[]}
+function getKeyframe(layer,frame){
+ const arr=layer.FR||[];let found=null;
+ for(const f of arr){if(Number(f.I)<=frame && (!found||Number(f.I)>Number(found.I)))found=f;}
+ return found;
+}
+function symbolMap(root){
+ const map=new Map();
+ for(const s of root?.SD?.S||[]) if(s.SN)map.set(s.SN,s);
+ return map;
+}
+let symbols=null, bounds={minX:0,minY:0,maxX:1,maxY:1}, rootName='';
+function spriteSize(id){
+ const s=atlasMap.get(String(id));if(!s)throw Error('Не найден спрайт атласа с ID '+id);
+ return {w:Number(s.w),h:Number(s.h),s};
+}
+function walkSymbol(name,frame,parent,alpha,depth,visit){
+ if(depth>40)throw Error('Слишком глубокая вложенность символов (возможен цикл): '+name);
+ const sym=name==='__ROOT__'?{TL:anim.AN.TL}:symbols.get(name);
+ if(!sym){missingSymbols.add(name);return;}
+ let layers=layersOf(sym);
+ if($('reverse').checked)layers=layers.slice().reverse();
+ for(const layer of layers){
+  const kf=getKeyframe(layer,frame);
+  if(!kf)continue;
+  const layerAlpha=alpha*layerOpacity(kf);
+  for(const el of (kf.E||[])){
+   if(el.ASI){
+    const id=String(el.ASI.N), {w,h,s}=spriteSize(id);
+    const tr=mul(parent,matrix(el.ASI.M3D));
+    visit(id,s,tr,layerAlpha,w,h);
+   }else if(el.SI){
+    const si=el.SI, childName=si.SN;
+    const local=Number(kf.I)||0, elapsed=Math.max(0,frame-local);
+    const child=symbols.get(childName);
+    if(!child){missingSymbols.add(childName);continue;}
+    const total=timelineLength(child);
+    let childFrame=Number(si.FF)||0;
+    const mode=si.LP||'SF';
+    if(mode==='LP' || mode==='PO'){
+      childFrame+=elapsed;
+      if(mode==='LP'&&total>0)childFrame=((childFrame%total)+total)%total;
+      else if(total>0)childFrame=Math.min(childFrame,total-1);
+    }
+    walkSymbol(childName,childFrame,mul(parent,matrix(si.M3D)),layerAlpha,depth+1,visit);
+   }
+  }
+ }
+}
+function layerOpacity(kf){
+ const ca=kf.C;
+ if(ca&&ca.M==='CA'&&Number.isFinite(Number(ca.AM)))return Math.max(0,Math.min(1,Number(ca.AM)));
+ return 1;
+}
+function timelineLength(sym){
+ let n=1;for(const l of layersOf(sym))for(const f of l.FR||[])n=Math.max(n,(Number(f.I)||0)+(Number(f.DU)||1));
+ return n;
+}
+const missingSymbols=new Set();
+function collectBounds(){
+ missingSymbols.clear();
+ let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+ for(let f=0;f<stage.count;f++){
+  walkSymbol('__ROOT__',f,[1,0,0,1,0,0],1,0,(id,s,tr,alpha,w,h)=>{
+   const [a,b,c,d,e,g]=tr;
+   for(const [x,y] of [[0,0],[w,0],[0,h],[w,h]]){
+    const X=a*x+c*y+e,Y=b*x+d*y+g;
+    minX=Math.min(minX,X);minY=Math.min(minY,Y);maxX=Math.max(maxX,X);maxY=Math.max(maxY,Y);
+   }
+  });
+ }
+ if(!Number.isFinite(minX))throw Error('Не удалось найти ни одного видимого ASI. Проверь структуру AN/SD.');
+ const pad=4;
+ bounds={minX:Math.floor(minX)-pad,minY:Math.floor(minY)-pad,maxX:Math.ceil(maxX)+pad,maxY:Math.ceil(maxY)+pad};
+ stage.w=bounds.maxX-bounds.minX;stage.h=bounds.maxY-bounds.minY;
+ if(stage.w>4096||stage.h>4096)throw Error('Расчётный кадр слишком большой: '+stage.w+'×'+stage.h+' px. Проверь M3D.');
+}
+function renderFrame(frame){
+ const c=document.createElement('canvas');c.width=stage.w;c.height=stage.h;
+ const ctx=c.getContext('2d');
+ ctx.translate(-bounds.minX,-bounds.minY);
+ walkSymbol('__ROOT__',frame,[1,0,0,1,0,0],1,0,(id,s,tr,alpha,w,h)=>{
+  const [a,b,cc,d,e,f]=tr;
+  ctx.save();ctx.globalAlpha=Math.max(0,Math.min(1,alpha));
+  ctx.setTransform(a,b,cc,d,e-bounds.minX,f-bounds.minY);
+  const x=Number(s.x),y=Number(s.y),sw=Number(s.w),sh=Number(s.h);
+  if(s.rotated){
+   ctx.translate(0,h);ctx.rotate(-Math.PI/2);
+   ctx.drawImage(atlasImg,x,y,sw,sh,0,0,h,w);
+  }else ctx.drawImage(atlasImg,x,y,sw,sh,0,0,w,h);
+  ctx.restore();
+ });
+ return c;
+}
+function renderAll(){
+ frames=[];for(let i=0;i<stage.count;i++)frames.push(renderFrame(i));
+}
+function updatePreview(){
+ if(!frames.length)return;
+ const c=frames[current],p=$('preview'),ctx=p.getContext('2d');
+ p.width=c.width;p.height=c.height;ctx.clearRect(0,0,p.width,p.height);ctx.drawImage(c,0,0);
+ $('frameText').textContent=`Кадр ${current+1} / ${frames.length}`;
+ $('prev').disabled=$('next').disabled=frames.length<2;
+}
+function stop(){if(timer){clearInterval(timer);timer=null;}$('play').textContent='▶ Воспроизвести';}
+$('build').onclick=async()=>{
+ stop();frames=[];$('export').disabled=true;
+ try{
+  const pf=$('png').files[0],af=$('atlas').files[0],jf=$('anim').files[0];
+  if(!pf||!af||!jf)throw Error('Нужно выбрать все три файла.');
+  status('Читаю файлы…');
+  const [atlasText,animText]=await Promise.all([af.text(),jf.text()]);
+  atlasMap=parseAtlas(JSON.parse(atlasText.replace(/^\uFEFF/,'')));anim=JSON.parse(animText.replace(/^\uFEFF/,''));
+  if(!anim.AN?.TL?.L)throw Error('В Animation.json нет AN.TL.L');
+  symbols=symbolMap(anim);rootName=anim.AN.SN||'';
+  if(!symbols.size)throw Error('В Animation.json не найден массив SD.S');
+  atlasImg=new Image();atlasImg.src=URL.createObjectURL(pf);
+  await new Promise((ok,no)=>{atlasImg.onload=ok;atlasImg.onerror=()=>no(Error('Не удалось открыть PNG атлас'));});
+  const mainLayers=anim.AN.TL.L;
+  let count=1;for(const l of mainLayers)for(const f of l.FR||[])count=Math.max(count,(Number(f.I)||0)+(Number(f.DU)||1));
+  stage={count,w:1,h:1};
+  status(`Найдено символов SD: ${symbols.size}. Рассчитываю общие границы ${count} кадров…`);
+  collectBounds();
+  status(`Размер общего кадра: ${stage.w}×${stage.h}. Рендерю вложенные символы…`);
+  await new Promise(r=>setTimeout(r,30));
+  renderAll();current=0;updatePreview();
+  $('play').disabled=false;$('export').disabled=false;$('prev').disabled=$('next').disabled=false;
+  fps=Number($('speed').value);
+  const msg=[`Готово: ${frames.length} кадров, ${fps} FPS.`,`Символов SD: ${symbols.size}.`,`Общий размер кадра: ${stage.w}×${stage.h}.`];
+  if(missingSymbols.size)msg.push('Не найдены символы: '+[...missingSymbols].join(', '));
+  status(msg.join('\n'));
+  $('exportInfo').textContent=`Будет создан PNG-атлас и XML для ${rootName||anim.AN.N}.`;
+ }catch(e){status('ОШИБКА: '+(e?.message||e));console.error(e);}
+};
+$('prev').onclick=()=>{if(!frames.length)return;current=(current-1+frames.length)%frames.length;updatePreview();};
+$('next').onclick=()=>{if(!frames.length)return;current=(current+1)%frames.length;updatePreview();};
+$('play').onclick=()=>{
+ if(!frames.length)return;
+ if(timer){stop();return;}
+ $('play').textContent='Ⅱ Пауза';timer=setInterval(()=>{current=(current+1)%frames.length;updatePreview();},1000/Number($('speed').value));
+};
+$('speed').oninput=()=>{$('speedText').textContent=$('speed').value+' FPS';if(timer){stop();$('play').click();}};
+$('export').onclick=()=>{
+ try{
+  if(!frames.length)return;
+  const gap=2,maxW=4096,maxH=8192,maxPixels=32000000;
+  status('Обрезаю прозрачные края кадров…');
+  const trimmed=frames.map(f=>{
+   const w=f.width,h=f.height,data=f.getContext('2d').getImageData(0,0,w,h).data;
+   let minX=w,minY=h,maxX=-1,maxY=-1;
+   for(let y=0;y<h;y++)for(let x=0;x<w;x++)if(data[(y*w+x)*4+3]!==0){
+    if(x<minX)minX=x;if(x>maxX)maxX=x;if(y<minY)minY=y;if(y>maxY)maxY=y;
+   }
+   if(maxX<0)return {canvas:null,w:1,h:1,trimX:0,trimY:0};
+   const tw=maxX-minX+1,th=maxY-minY+1,c=document.createElement('canvas');
+   c.width=tw;c.height=th;c.getContext('2d').drawImage(f,minX,minY,tw,th,0,0,tw,th);
+   return {canvas:c,w:tw,h:th,trimX:minX,trimY:minY};
+  });
+  // Shelf-pack rectangles instead of forcing every frame into a rigid grid.
+  // If the full-resolution atlas still exceeds browser/GPU limits, uniformly
+  // downscale all frames and their XML offsets together (never crop artwork).
+  function pack(scale){
+   const items=trimmed.map((f,i)=>({i,w:Math.max(1,Math.ceil(f.w*scale)),h:Math.max(1,Math.ceil(f.h*scale))})).sort((a,b)=>b.h-a.h||b.w-a.w);
+   let best=null;
+   for(const binW of [1024,1536,2048,3072,4096]){
+    let x=gap,y=gap,rowH=0,placements=Array(items.length);
+    for(const it of items){
+     if(it.w+gap>binW){y=Infinity;break;}
+     if(x+it.w+gap>binW){y+=rowH+gap;x=gap;rowH=0;}
+     placements[it.i]={x,y,w:it.w,h:it.h};x+=it.w+gap;rowH=Math.max(rowH,it.h);
+    }
+    const usedW=Math.min(binW,Math.max(1,...placements.filter(Boolean).map(p=>p.x+p.w+gap)));
+    const usedH=y===Infinity?Infinity:y+rowH+gap,area=usedW*usedH;
+    if(usedH>maxH||area>maxPixels||!Number.isFinite(usedH))continue;
+    const score=area+Math.abs(Math.log(Math.max(1,usedW/usedH)))*500;
+    if(!best||score<best.score)best={placements,w:usedW,h:usedH,score,scale};
+   }
+   return best;
+  }
+  let best=pack(1);
+  if(!best){
+   let lo=0.03,hi=1,fit=null;
+   for(let k=0;k<20;k++){
+    const mid=(lo+hi)/2,candidate=pack(mid);
+    if(candidate){fit=candidate;lo=mid;}else hi=mid;
+   }
+   best=fit;
+  }
+  if(!best)throw Error('Даже после автоматического уменьшения не удалось упаковать кадры. Попробуй выбрать более короткую анимацию.');
+  const sheet=document.createElement('canvas');sheet.width=best.w;sheet.height=best.h;
+  const ctx=sheet.getContext('2d'),prefix=(rootName||anim.AN.N||'animation').replace(/[^a-z0-9_-]+/gi,'_');
+  let xml=`<?xml version="1.0" encoding="utf-8"?>\n<TextureAtlas imagePath="${prefix}.png">\n`;
+  trimmed.forEach((f,i)=>{
+   const p=best.placements[i];
+   if(f.canvas)ctx.drawImage(f.canvas,p.x,p.y,p.w,p.h);
+   const sc=best.scale;
+   xml+=` <SubTexture name="${prefix}${String(i).padStart(4,'0')}" x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" frameX="${Math.round(-f.trimX*sc)}" frameY="${Math.round(-f.trimY*sc)}" frameWidth="${Math.max(1,Math.round(stage.w*sc))}" frameHeight="${Math.max(1,Math.round(stage.h*sc))}"/>\n`;
+  });
+  xml+='</TextureAtlas>';
+  status('Создаю PNG-атлас…');
+  sheet.toBlob(blob=>{
+   if(!blob){status('Не удалось создать PNG. Браузеру не хватило памяти при кодировании.');return;}
+   download(blob,prefix+'.png');
+   setTimeout(()=>download(new Blob([xml],{type:'application/xml'}),prefix+'.xml'),350);
+   const percent=Math.round(best.scale*100);
+   status(`Экспорт готов.\nPNG: ${best.w}×${best.h}\nКадров: ${frames.length}\nМасштаб экспорта: ${percent}%${best.scale<0.999?' (автоматически уменьшен, чтобы атлас поместился)':' (100%, без уменьшения)'}\nПрозрачные края обрезаны; положение кадров сохранено в XML с тем же масштабом.`);
+   $('exportInfo').textContent=`Атлас ${best.w}×${best.h}; масштаб ${percent}%; ${frames.length} кадров.`;
+  },'image/png');
+ }catch(e){status('ОШИБКА ЭКСПОРТА: '+e.message);}
+};
+function download(blob,name){const a=document.createElement('a'),u=URL.createObjectURL(blob);a.href=u;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),5000);}
+})();
+</script>
+</body>
+</html>
